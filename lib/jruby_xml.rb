@@ -35,6 +35,7 @@ module JRubyXML
     
     # Errors will be TransformerException objects
     def fatalError(e)
+      Rails.logger.error(e.getMessage)
       locator = e.getLocator()
       raise ParseError.new(locator.getLineNumber, locator.getColumnNumber), 
         e.getMessage

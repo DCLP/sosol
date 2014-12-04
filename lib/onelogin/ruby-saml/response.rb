@@ -142,12 +142,13 @@ module Onelogin
         valid_structure = validate_structure(soft)
         valid_response_state = validate_response_state(soft)
         valid_conditions = validate_conditions(soft)
-        valid_doc = document.validate(get_fingerprint, soft)
+        valid_doc = document.validate_document(get_fingerprint, soft)
         valid_structure && Rails.logger.info("Valid Structure #{valid_structure}")
         Rails.logger.debug("Valid Response State #{valid_response_state}")
         Rails.logger.debug("Valid Conditions #{valid_conditions}")
         Rails.logger.debug("Valid Doc #{valid_doc}")
         Rails.logger.debug("Success #{success?}")
+        Rails.logger.debug("Errors #{document.errors.inspect}")
         valid_structure      &&
         valid_response_state &&
         valid_conditions     &&

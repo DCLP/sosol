@@ -26,6 +26,7 @@ require 'rubygems'
 require "rexml/document"
 require "rexml/xpath"
 require "openssl"
+require 'nokogiri'
 require "xmlcanonicalizer"
 require "digest/sha1"
 require "digest/sha2"
@@ -33,78 +34,237 @@ require "onelogin/ruby-saml/validation_error"
 
 module XMLSecurity
 
-  class SignedDocument < REXML::Document
-    C14N = "http://www.w3.org/2001/10/xml-exc-c14n#"
-    DSIG = "http://www.w3.org/2000/09/xmldsig#"
+  class BaseDocument < REXML::Document
 
-    attr_accessor :signed_element_id, :sig_element
+    C14N            = "http://www.w3.org/2001/10/xml-exc-c14n#"
+    DSIG            = "http://www.w3.org/2000/09/xmldsig#"
 
-    def initialize(response)
+    def canon_algorithm(element)
+      algorithm = element
+      if algorithm.is_a?(REXML::Element)
+        algorithm = element.attribute('Algorithm').value
+      end
+
+      Rails.logger.info("ALG=#{algorithm}")
+
+      case algorithm
+        when "http://www.w3.org/2001/10/xml-exc-c14n#"         then Nokogiri::XML::XML_C14N_EXCLUSIVE_1_0
+        when "http://www.w3.org/TR/2001/REC-xml-c14n-20010315" then Nokogiri::XML::XML_C14N_1_0
+        when "http://www.w3.org/2006/12/xml-c14n11"            then Nokogiri::XML::XML_C14N_1_1
+        else                                                        Nokogiri::XML::XML_C14N_EXCLUSIVE_1_0
+      end
+    end
+
+    def algorithm(element)
+      algorithm = element
+      if algorithm.is_a?(REXML::Element)
+        algorithm = element.attribute("Algorithm").value
+        algorithm = algorithm && algorithm =~ /sha(.*?)$/i && $1.to_i
+      end
+
+      Rails.logger.info("ALG2=#{algorithm}")
+      case algorithm
+      when 256 then OpenSSL::Digest::SHA256
+      when 384 then OpenSSL::Digest::SHA384
+      when 512 then OpenSSL::Digest::SHA512
+      else
+        OpenSSL::Digest::SHA1
+      end
+    end
+
+  end
+
+  class Document < BaseDocument
+    SHA1            = "http://www.w3.org/2000/09/xmldsig#rsa-sha1"
+    SHA256          = "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"
+    SHA384          = "http://www.w3.org/2001/04/xmldsig-more#rsa-sha384"
+    SHA512          = "http://www.w3.org/2001/04/xmldsig-more#rsa-sha512"
+    ENVELOPED_SIG   = "http://www.w3.org/2000/09/xmldsig#enveloped-signature"
+    INC_PREFIX_LIST = "#default samlp saml ds xs xsi"
+
+    attr_accessor :uuid
+
+    #<Signature>
+      #<SignedInfo>
+        #<CanonicalizationMethod />
+        #<SignatureMethod />
+        #<Reference>
+           #<Transforms>
+           #<DigestMethod>
+           #<DigestValue>
+        #</Reference>
+        #<Reference /> etc.
+      #</SignedInfo>
+      #<SignatureValue />
+      #<KeyInfo />
+      #<Object />
+    #</Signature>
+    def sign_document(private_key, certificate, signature_method = SHA1, digest_method = SHA1)
+      canoner                       = XML::Util::XmlCanonicalizer.new(false, true)
+      inclusive_namespaces = INC_PREFIX_LIST.split(" ")
+      canoner.inclusive_namespaces  = inclusive_namespaces if canoner.respond_to?(:inclusive_namespaces) && !inclusive_namespaces.empty?
+      canon_doc          = canoner.canonicalize(self)
+      signature_element = REXML::Element.new("ds:Signature").add_namespace('ds', DSIG)
+      signed_info_element = signature_element.add_element("ds:SignedInfo")
+      signed_info_element.add_element("ds:CanonicalizationMethod", {"Algorithm" => C14N})
+      signed_info_element.add_element("ds:SignatureMethod", {"Algorithm"=>signature_method})
+
+      # Add Reference
+      reference_element = signed_info_element.add_element("ds:Reference", {"URI" => "##{uuid}"})
+
+      # Add Transforms
+      transforms_element = reference_element.add_element("ds:Transforms")
+      transforms_element.add_element("ds:Transform", {"Algorithm" => ENVELOPED_SIG})
+      transforms_element.add_element("ds:Transform", {"Algorithm" => C14N})
+      pfx_list = "#default samlp saml ds xs xsi"
+      transforms_element.add_element("InclusiveNamespaces", {"xmlns" => C14N, "PrefixList" => pfx_list})
+
+      digest_method_element = reference_element.add_element("ds:DigestMethod", {"Algorithm" => 'http://www.w3.org/2000/09/xmldsig#sha1'})
+      digest = compute_digest(canon_doc, algorithm(digest_method_element))
+      reference_element.add_element("ds:DigestValue").text = digest
+      Rails.logger.info("Decoded #{Base64.decode64(digest)}")
+      Rails.logger.info("HAshed E= #{canon_doc.to_s}")
+
+      # add SignatureValue
+      canon_string = canoner.canonicalize(signed_info_element)
+      signature = compute_signature(private_key, algorithm(signature_method).new, canon_string)
+      signature_element.add_element("ds:SignatureValue").text = signature
+
+      # add KeyInfo
+      key_info_element       = signature_element.add_element("ds:KeyInfo")
+      x509_element           = key_info_element.add_element("ds:X509Data")
+      x509_cert_element      = x509_element.add_element("ds:X509Certificate")
+      if certificate.is_a?(String)
+        certificate = OpenSSL::X509::Certificate.new(certificate)
+      end
+      x509_cert_element.text = Base64.encode64(certificate.to_der).gsub(/\n/, "")
+
+      # add the signature
+      issuer_element = self.elements["//saml:Issuer"]
+      if issuer_element
+        self.root.insert_after issuer_element, signature_element
+      else
+        self.root.add_element(signature_element)
+      end
+    end
+
+    protected
+
+    def compute_signature(private_key, signature_algorithm, document)
+      Base64.encode64(private_key.sign(signature_algorithm, document)).gsub(/\n/, "")
+    end
+
+    def compute_digest(document, digest_algorithm)
+      digest = digest_algorithm.digest(document)
+      Rails.logger.info("digest p64 #{digest}")
+      Base64.encode64(digest).gsub(/\n/, "")
+    end
+
+  end
+
+  class SignedDocument < BaseDocument
+
+    attr_accessor :signed_element_id
+    attr_accessor :errors
+
+    def initialize(response, errors = [])
       super(response)
+      @errors = errors
       extract_signed_element_id
     end
 
-    def validate(idp_cert_fingerprint, soft = true)
+    def validate_document(idp_cert_fingerprint, soft = true)
+      Rails.logger.info("Validating #{self.to_s}")
       # get cert from response
-      test = ""
-      self.write(test,1);
-      Rails.logger.info("validating #{test}")
       cert_element = REXML::XPath.first(self, "//ds:X509Certificate", { "ds"=>DSIG })
+      unless cert_element
+        if soft
+          Rails.logger.info("No cert")
+          return false
+        else
+          raise OneLogin::RubySaml::ValidationError.new("Certificate element missing in response (ds:X509Certificate)")
+        end
+      end
       base64_cert  = cert_element.text
       cert_text    = Base64.decode64(base64_cert)
       cert         = OpenSSL::X509::Certificate.new(cert_text)
 
       # check cert matches registered idp cert
       fingerprint = Digest::SHA1.hexdigest(cert.to_der)
-      
-      Rails.logger.info("Checking fingerprint #{idp_cert_fingerprint.gsub(/[^a-zA-Z0-9]/,"").downcase} == #{fingerprint}")
-    
 
       if fingerprint != idp_cert_fingerprint.gsub(/[^a-zA-Z0-9]/,"").downcase
-        return soft ? false : (raise Onelogin::Saml::ValidationError.new("Fingerprint mismatch"))
+        @errors << "Fingerprint mismatch"
+        return soft ? false : (raise OneLogin::RubySaml::ValidationError.new("Fingerprint mismatch"))
       end
-      
-      Rails.logger.info("Moving on to validate_doc")
+      Rails.logger.info("Moving to validate signature")
 
-      validate_doc(base64_cert, soft)
+      validate_signature(base64_cert, soft)
     end
 
-    def validate_doc(base64_cert, soft = true)
+    def validate_signature(base64_cert, soft = true)
       # validate references
 
       # check for inclusive namespaces
       inclusive_namespaces = extract_inclusive_namespaces
+      #inclusive_namespaces = "#default samlp saml ds xs xsi".split(" ")
+      #Rails.logger.info("IN #{inclusive_namespaces} == #{extract_inclusive_namespaces}")
+
+
+      document = Nokogiri.parse(self.to_s)
+
+      # create a working copy so we don't modify the original
+      @working_copy ||= REXML::Document.new(self.to_s).root
 
       # store and remove signature node
-      self.sig_element ||= begin
-        element = REXML::XPath.first(self, "//ds:Signature", {"ds"=>DSIG})
+      @sig_element ||= begin
+        element = REXML::XPath.first(@working_copy, "//ds:Signature", {"ds"=>DSIG})
         element.remove
       end
 
-      Rails.logger.info("Checking digests")
+      # verify signature
+      signed_info_element     = REXML::XPath.first(@sig_element, "//ds:SignedInfo", {"ds"=>DSIG})
+      noko_sig_element = document.at_xpath('//ds:Signature', 'ds' => DSIG)
+      noko_signed_info_element = noko_sig_element.at_xpath('./ds:SignedInfo', 'ds' => DSIG)
+      canon_algorithm = canon_algorithm REXML::XPath.first(@sig_element, '//ds:CanonicalizationMethod', 'ds' => DSIG)
+      canon_string = noko_signed_info_element.canonicalize(canon_algorithm)
+      noko_sig_element.remove
+
+      # store and remove signature node
+      rexml_sig_element ||= begin
+        element = REXML::XPath.first(self, "//ds:Signature", {"ds"=>DSIG})
+        element.remove
+      end
       # check digests
-      REXML::XPath.each(sig_element, "//ds:Reference", {"ds"=>DSIG}) do |ref|
+      REXML::XPath.each(rexml_sig_element, "//ds:Reference", {"ds"=>DSIG}) do |ref|
         uri                           = ref.attributes.get_attribute("URI").value
+        Rails.logger.info("uri = #{uri}")
+       # hashed_element                = document.at_xpath("//*[@ID='#{uri[1..-1]}']")
         hashed_element                = REXML::XPath.first(self, "//[@ID='#{uri[1..-1]}']")
+        canon_algorithm               = canon_algorithm REXML::XPath.first(ref, '//ds:CanonicalizationMethod', 'ds' => DSIG)
+        #canon_hashed_element          = hashed_element.canonicalize(canon_algorithm, inclusive_namespaces)
+        #Rails.logger.info("canon_hashed_element=#{canon_hashed_element.to_s}")
         canoner                       = XML::Util::XmlCanonicalizer.new(false, true)
         canoner.inclusive_namespaces  = inclusive_namespaces if canoner.respond_to?(:inclusive_namespaces) && !inclusive_namespaces.empty?
         canon_hashed_element          = canoner.canonicalize(hashed_element).gsub('&','&amp;')
-        digest_algorithm              = algorithm(REXML::XPath.first(ref, "//ds:DigestMethod"))
+        Rails.logger.info("canon_hashed_element=#{canon_hashed_element.to_s}")
+        digest_algorithm              = algorithm(REXML::XPath.first(ref, "//ds:DigestMethod", 'ds' => DSIG))
+        Rails.logger.info(REXML::XPath.first(ref, "//ds:DigestValue", {"ds"=>DSIG}).text)
+
         hash                          = digest_algorithm.digest(canon_hashed_element)
         digest_value                  = Base64.decode64(REXML::XPath.first(ref, "//ds:DigestValue", {"ds"=>DSIG}).text)
 
         unless digests_match?(hash, digest_value)
-          return soft ? false : (raise Onelogin::Saml::ValidationError.new("Digest mismatch"))
+          @errors << "Digest mismatch HASH #{hash} DIGEST #{digest_value}"
+          return soft ? false : (raise OneLogin::RubySaml::ValidationError.new("Digest mismatch"))
         end
       end
+      Rails.logger.info("New canon string #{canon_string}")
+      canoner                       = XML::Util::XmlCanonicalizer.new(false, true)
+      canoner.inclusive_namespaces  = inclusive_namespaces if canoner.respond_to?(:inclusive_namespaces) && !inclusive_namespaces.empty?
+      canon_string = canoner.canonicalize(signed_info_element)
+      Rails.logger.info("Old canon string #{canon_string}")
 
-      Rails.logger.info("Verifying signature")
-      # verify signature
-      canoner                 = XML::Util::XmlCanonicalizer.new(false, true)
-      signed_info_element     = REXML::XPath.first(sig_element, "//ds:SignedInfo", {"ds"=>DSIG})
-      canon_string            = canoner.canonicalize(signed_info_element)
-
-      base64_signature        = REXML::XPath.first(sig_element, "//ds:SignatureValue", {"ds"=>DSIG}).text
+      base64_signature        = REXML::XPath.first(@sig_element, "//ds:SignatureValue", {"ds"=>DSIG}).text
       signature               = Base64.decode64(base64_signature)
 
       # get certificate object
@@ -115,10 +275,10 @@ module XMLSecurity
       signature_algorithm     = algorithm(REXML::XPath.first(signed_info_element, "//ds:SignatureMethod", {"ds"=>DSIG}))
 
       unless cert.public_key.verify(signature_algorithm.new, signature, canon_string)
-        return soft ? false : (raise Onelogin::Saml::ValidationError.new("Key validation error"))
+        @errors << "Key validation error SIG #{signature} #{canon_string}"
+        return soft ? false : (raise OneLogin::RubySaml::ValidationError.new("Key validation error"))
       end
 
-      Rails.logger.info("Verified signature")
       return true
     end
 
@@ -133,18 +293,6 @@ module XMLSecurity
       self.signed_element_id  = reference_element.attribute("URI").value[1..-1] unless reference_element.nil?
     end
 
-    def algorithm(element)
-      algorithm = element.attribute("Algorithm").value if element
-      algorithm = algorithm && algorithm =~ /sha(.*?)$/i && $1.to_i
-      case algorithm
-      when 256 then OpenSSL::Digest::SHA256
-      when 384 then OpenSSL::Digest::SHA384
-      when 512 then OpenSSL::Digest::SHA512
-      else
-        OpenSSL::Digest::SHA1
-      end
-    end
-    
     def extract_inclusive_namespaces
       if element = REXML::XPath.first(self, "//ec:InclusiveNamespaces", { "ec" => C14N })
         prefix_list = element.attributes.get_attribute("PrefixList").value
